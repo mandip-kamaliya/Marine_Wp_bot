@@ -1,0 +1,2 @@
+"""Marine Supabase repositories."""
+

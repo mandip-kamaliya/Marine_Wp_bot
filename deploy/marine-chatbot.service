@@ -1,0 +1,17 @@
+[Unit]
+Description=ECHT Marine WhatsApp Chatbot FastAPI
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Marine_Wp_bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/Marine_Wp_bot/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8001
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
