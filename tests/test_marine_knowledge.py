@@ -2,6 +2,7 @@ from pathlib import Path
 
 from app.services.marine_knowledge import MarineKnowledgeService
 from app.services.marine_sales import MarineContext, process_marine_message
+from app.services.marine_understanding import MarineUnderstandingService
 
 
 KB = Path(__file__).resolve().parents[1] / "documents/active/ECHT_MARINE_KNOWLEDGE_BASE_V2.md"
@@ -27,13 +28,14 @@ def test_aqua_cycle_question_uses_approved_knowledge_before_menu_flow():
     assert result.handover is False
 
 
-def test_commercial_question_is_answered_cautiously_and_handed_over():
+def test_commercial_question_collects_details_without_inventing_a_price():
     service = MarineKnowledgeService(KB, responder)
     result = process_marine_message(
-        "What is the Pontoon price and delivery time?", MarineContext(), knowledge=service,
+        "What is the Pontoon price?", MarineContext(), knowledge=service,
+        understanding=MarineUnderstandingService(),
     )
-    assert result.handover is True
-    assert result.handover_reason == "commercial_or_technical_confirmation"
+    assert result.handover is False
+    assert "Pricing depends" in result.text
 
 
 def test_internal_only_sections_are_never_retrieved():
@@ -44,3 +46,45 @@ def test_internal_only_sections_are_never_retrieved():
     )
     service.answer("What facts must the bot not say without confirmation?")
     assert not any("INTERNAL ONLY" in heading or "FACTS THE BOT" in heading for heading in seen)
+
+
+def test_rich_free_text_merges_facts_then_asks_only_next_missing_requirement():
+    result = process_marine_message(
+        "I need 2 Pontoon Boats for my resort in Udaipur, around 12 people each. What is the price?",
+        MarineContext(),
+        understanding=MarineUnderstandingService(),
+    )
+
+    assert result.context.product == "Pontoon Boat"
+    assert result.context.application == "Resort / Hotel"
+    assert result.context.quantity == 2
+    assert result.context.passenger_capacity == 12
+    assert result.context.project_location == "Udaipur"
+    assert "Pricing depends" in result.text
+    assert "lake, river, reservoir or coastal" in result.text
+    assert "how many passengers" not in result.text.casefold()
+    assert "project city" not in result.text.casefold()
+
+
+def test_question_interrupts_old_state_then_returns_to_next_missing_fact():
+    service = MarineKnowledgeService(KB, responder)
+    result = process_marine_message(
+        "12 people, what engine does it use?",
+        MarineContext(product="Pontoon Boat", application="Resort / Hotel", state="project_location"),
+        knowledge=service,
+        understanding=MarineUnderstandingService(),
+    )
+
+    assert result.context.passenger_capacity == 12
+    assert "Published Luxury Pontoon" in result.text
+    assert "project city or location" in result.text
+
+
+def test_live_stock_request_is_handed_to_a_person_not_invented():
+    result = process_marine_message(
+        "Do you have a Pontoon Boat in stock and available now?",
+        MarineContext(), understanding=MarineUnderstandingService(),
+    )
+
+    assert result.handover is True
+    assert result.handover_reason == "live_inventory_requested"

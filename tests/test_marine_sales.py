@@ -1,6 +1,7 @@
 """ECHT Marine sales-flow behavior tests."""
 
 from app.services.marine_sales import process_marine_message, start_marine_flow
+from app.services.marine_understanding import MarineUnderstandingService
 
 
 def advance(text: str, reply):
@@ -56,9 +57,11 @@ def test_invalid_capacity_is_corrected_without_losing_previous_answers() -> None
         reply = advance(answer, reply)
 
     invalid = advance("not sure", reply)
-    valid = advance("10 passengers", invalid)
+    valid = process_marine_message(
+        "10 passengers", invalid.context, understanding=MarineUnderstandingService(),
+    )
 
-    assert "12 people" in invalid.text
+    assert "project city or location" in invalid.text
     assert invalid.context.application == "Tourism Project"
     assert valid.context.passenger_capacity == 10
     assert valid.context.state == "project_location"
@@ -129,3 +132,38 @@ def test_customer_can_request_human_from_any_active_state() -> None:
 
     assert reply.handover is True
     assert reply.handover_reason == "customer_requested_human"
+
+
+def test_pontoon_uncertain_capacity_moves_to_location_without_inventing_a_seat_count() -> None:
+    reply = start_marine_flow()
+    for answer in ("marine_buy_products", "product_pontoon", "use_resort", "not sure"):
+        reply = advance(answer, reply)
+
+    assert reply.context.passenger_capacity is None
+    assert reply.context.state == "project_location"
+    assert "project city or location" in reply.text
+
+
+def test_pontoon_completion_never_defaults_to_an_eight_seater() -> None:
+    reply = start_marine_flow()
+    for answer in (
+        "marine_buy_products", "product_pontoon", "use_resort", "12 people", "Udaipur", "water_lake",
+    ):
+        reply = advance(answer, reply)
+
+    assert "8-seater" not in reply.text
+    assert "Pontoon Boat requirement" in reply.text
+    assert "Final capacity" in reply.text
+
+
+def test_speed_boat_selection_stays_in_speed_boat_qualification() -> None:
+    reply = start_marine_flow()
+    for answer in (
+        "marine_buy_products", "product_speed_boat", "speed_use_water_sports", "idk", "Goa", "water_coastal_location",
+    ):
+        reply = advance(answer, reply)
+
+    assert reply.context.product == "Speed Boat"
+    assert reply.context.passenger_capacity is None
+    assert "Speed Boat requirement" in reply.text
+    assert "Pontoon" not in reply.text

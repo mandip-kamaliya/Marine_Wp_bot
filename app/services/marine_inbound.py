@@ -15,6 +15,7 @@ from app.repositories.marine import DuplicateInboundMessageError, MarineReposito
 from app.schemas.exotel_webhook import NormalizedInboundMessage
 from app.services.marine_sales import MarineContext, process_marine_message
 from app.services.marine_knowledge import build_marine_knowledge_service
+from app.services.marine_understanding import build_marine_understanding_service
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -40,6 +41,7 @@ class MarineInboundProcessor:
         self.exotel = exotel
         self.zoho = zoho
         self.knowledge = build_marine_knowledge_service(settings)
+        self.understanding = build_marine_understanding_service(settings)
 
     async def process(self, message: NormalizedInboundMessage) -> ProcessingResult:
         if message.business_whatsapp_number != self.settings.exotel_whatsapp_from:
@@ -76,6 +78,7 @@ class MarineInboundProcessor:
             context.customer_name = message.profile_name
         reply = process_marine_message(
             message.content or "", context, knowledge=self.knowledge,
+            understanding=self.understanding,
         )
         await run_in_threadpool(
             self.repository.save_context, conversation["id"], reply.context

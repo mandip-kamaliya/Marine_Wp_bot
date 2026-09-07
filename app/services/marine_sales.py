@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from app.services.marine_knowledge import MarineKnowledgeService, looks_like_knowledge_question
+from app.services.marine_understanding import MarineUnderstanding, MarineUnderstandingService
 
 
 class MarineAction(BaseModel):
@@ -38,6 +39,8 @@ class MarineContext(BaseModel):
     tender_available: bool | None = None
     support_type: str | None = None
     support_reference: str | None = None
+    last_intent: str | None = None
+    last_question_topic: str | None = None
 
 
 class MarineReply(BaseModel):
@@ -103,13 +106,35 @@ def process_marine_message(
     context: MarineContext,
     *,
     knowledge: MarineKnowledgeService | None = None,
+    understanding: MarineUnderstandingService | None = None,
 ) -> MarineReply:
-    """Advance the explicit flow while retaining previously captured answers."""
+    """Handle the latest message first, then continue only with a useful next step."""
 
     value = text.strip()
     normalized = _normalize(value)
     if _is_human_request(normalized):
         return _handover(context, "customer_requested_human", "I'll connect you with our ECHT Marine team.")
+    if not _is_explicit_action(normalized) and not _is_form_collection_state(context.state):
+        facts = understanding.understand(value) if understanding is not None else MarineUnderstanding()
+        context = _merge_understanding(context, facts)
+        urgent = _live_confirmation_handover(context, facts)
+        if urgent is not None:
+            return urgent
+        commercial = _commercial_reply(context, facts)
+        if commercial is not None:
+            return commercial
+        if knowledge is not None and (facts.asks_question or looks_like_knowledge_question(value)):
+            answer = knowledge.answer(value)
+            if answer is not None:
+                if context.state == "new":
+                    context.state = "primary_intent"
+                if answer.handover:
+                    return _handover(context, answer.handover_reason or "knowledge_confirmation", answer.text)
+                return _answer_then_next(answer.text, context)
+        if facts.has_entities:
+            next_reply = _next_requirement_reply(context)
+            if next_reply is not None:
+                return next_reply
     if knowledge is not None and looks_like_knowledge_question(value):
         answer = knowledge.answer(value)
         if answer is not None:
@@ -131,6 +156,8 @@ def process_marine_message(
         "product": _product,
         "pontoon_use": _pontoon_use,
         "pontoon_capacity": _pontoon_capacity,
+        "speed_boat_use": _speed_boat_use,
+        "speed_boat_capacity": _speed_boat_capacity,
         "project_location": _project_location,
         "water_body": _water_body,
         "recommendation": _recommendation,
@@ -155,6 +182,102 @@ def process_marine_message(
     if handler is None:
         return start_marine_flow(customer_phone=context.customer_phone)
     return handler(value, normalized, context.model_copy(deep=True))
+
+
+def _merge_understanding(context: MarineContext, facts: MarineUnderstanding) -> MarineContext:
+    updated = context.model_copy(deep=True)
+    for field in ("product", "application", "passenger_capacity", "quantity", "project_location", "water_body", "timeline"):
+        value = getattr(facts, field)
+        if value is not None:
+            setattr(updated, field, value)
+    if facts.product:
+        updated.primary_intent = "floating_jetty" if facts.product == "Floating Jetty" else "buy_product"
+    if facts.asks_price:
+        updated.last_intent = "pricing"
+    elif facts.asks_quote:
+        updated.last_intent = "quotation"
+    elif facts.asks_question:
+        updated.last_intent = "knowledge_question"
+    return updated
+
+
+def _live_confirmation_handover(context: MarineContext, facts: MarineUnderstanding) -> MarineReply | None:
+    if facts.asks_human:
+        return _handover(context, "customer_requested_human", "I'll connect you with our ECHT Marine team.")
+    if facts.asks_tender:
+        return _handover(context, "tender_or_specification_requested", "Our ECHT Marine team will assist with the tender or technical specification.")
+    if facts.asks_live_availability:
+        return _handover(context, "live_inventory_requested", "Current stock and availability need a live confirmation. I'll connect you with our ECHT Marine team.")
+    if facts.asks_confirmed_delivery:
+        return _handover(context, "confirmed_delivery_requested", "Delivery commitments depend on the final product and project details. Our ECHT Marine team will confirm this with you.")
+    if facts.asks_custom_engineering:
+        return _handover(context, "engineering_confirmation_requested", "Custom engineering and final technical suitability need review by our ECHT Marine team. I'll connect you with them.")
+    return None
+
+
+def _commercial_reply(context: MarineContext, facts: MarineUnderstanding) -> MarineReply | None:
+    if not (facts.asks_price or facts.asks_quote):
+        return None
+    message = (
+        "Pricing depends on the product, configuration, capacity, project location and operating conditions. "
+        "I can collect the essentials so our ECHT Marine team can prepare the right quotation."
+    )
+    return _answer_then_next(message, context)
+
+
+def _answer_then_next(answer: str, context: MarineContext) -> MarineReply:
+    next_reply = _next_requirement_reply(context)
+    if next_reply is None:
+        return MarineReply(text=answer, context=context, actions=PRIMARY_ACTIONS)
+    return MarineReply(
+        text=f"{answer}\n\n{next_reply.text}", context=next_reply.context,
+        actions=next_reply.actions,
+    )
+
+
+def _next_requirement_reply(context: MarineContext) -> MarineReply | None:
+    """Ask only for the next missing qualification fact; never restart a rich message."""
+    if context.product == "Pontoon Boat":
+        if not context.application:
+            context.state = "pontoon_use"
+            return MarineReply(text="What are you planning to use the Pontoon Boat for?", context=context, actions=PONTOON_USE_ACTIONS)
+        if not context.passenger_capacity:
+            context.state = "pontoon_capacity"
+            return MarineReply(text="Approximately how many passengers would you like to accommodate?", context=context)
+        if not context.project_location:
+            context.state = "project_location"
+            return MarineReply(text="Where will the boat be operated? Please share the project city or location. 📍", context=context)
+        if not context.water_body:
+            context.state = "water_body"
+            return MarineReply(text="Is it for a lake, river, reservoir or coastal location?", context=context, actions=_actions("Lake", "River", "Reservoir", "Coastal Location", prefix="water"))
+        context.state = "recommendation"
+        return _water_body(context.water_body, _normalize(context.water_body), context)
+    if context.product == "Speed Boat":
+        if not context.application:
+            context.state = "speed_boat_use"
+            return MarineReply(text="What will the Speed Boat be used for?", context=context, actions=_actions("Resort / Tourism Rides", "Private Use", "Water Sports", "Commercial Operation", prefix="speed_use"))
+        if not context.passenger_capacity:
+            context.state = "speed_boat_capacity"
+            return MarineReply(text="Approximately how many passengers do you expect per ride?\n\n💡 Example: 4 passengers", context=context)
+        if not context.project_location:
+            context.state = "project_location"
+            return MarineReply(text="Where will the Speed Boat be operated? Please share the project city or location. 📍", context=context)
+        if not context.water_body:
+            context.state = "water_body"
+            return MarineReply(text="Is it for a lake, river, reservoir or coastal location?", context=context, actions=_actions("Lake", "River", "Reservoir", "Coastal Location", prefix="water"))
+        context.state = "recommendation"
+        return _water_body(context.water_body, _normalize(context.water_body), context)
+    if context.product == "Floating Jetty":
+        if not context.project_location:
+            context.state = "jetty_location"
+            return MarineReply(text="Where is the floating-jetty project located? 📍", context=context)
+        if not context.water_body:
+            context.state = "jetty_water_body"
+            return MarineReply(text="What type of water body is it?", context=context)
+    if context.product and not context.project_location:
+        context.state = "project_location"
+        return MarineReply(text=f"Where will the {context.product} be operated? Please share the project city or location. 📍", context=context)
+    return None
 
 
 def _primary_intent(value: str, normalized: str, context: MarineContext) -> MarineReply:
@@ -189,6 +312,13 @@ def _product(value: str, normalized: str, context: MarineContext) -> MarineReply
     if product == "Pontoon Boat":
         context.state = "pontoon_use"
         return MarineReply(text="What are you planning to use the Pontoon Boat for?", context=context, actions=PONTOON_USE_ACTIONS)
+    if product == "Speed Boat":
+        context.state = "speed_boat_use"
+        return MarineReply(
+            text="Great. What will the Speed Boat be used for?",
+            context=context,
+            actions=_actions("Resort / Tourism Rides", "Private Use", "Water Sports", "Commercial Operation", prefix="speed_use"),
+        )
     context.state = "project_location"
     return MarineReply(text=f"Great choice. Where will the {product} be operated? Please share the project city or location. 📍", context=context)
 
@@ -200,12 +330,48 @@ def _pontoon_use(value: str, normalized: str, context: MarineContext) -> MarineR
 
 
 def _pontoon_capacity(value: str, normalized: str, context: MarineContext) -> MarineReply:
+    if _is_uncertain(normalized):
+        context.state = "project_location"
+        return MarineReply(
+            text=("No problem 😊\n\nFor a resort or tourism operation, passenger capacity is usually planned "
+                  "around the expected guests per ride. Our Marine team can guide you on the right capacity.\n\n"
+                  "Where will the boat be operated? Please share the project city or location. 📍"),
+            context=context,
+        )
     count = _positive_integer(value)
     if count is None:
         return MarineReply(text="Please share the required passenger capacity. For example: 12 people", context=context)
     context.passenger_capacity = count
     context.state = "project_location"
     return MarineReply(text="Perfect. Where will the boat be operated? Please share the project city or location. 📍", context=context)
+
+
+def _speed_boat_use(value: str, normalized: str, context: MarineContext) -> MarineReply:
+    if _is_uncertain(normalized):
+        return MarineReply(
+            text="No problem 😊 Is the Speed Boat mainly for sightseeing rides, water sports, private leisure use, or commercial operation?",
+            context=context,
+            actions=_actions("Resort / Tourism Rides", "Private Use", "Water Sports", "Commercial Operation", prefix="speed_use"),
+        )
+    context.application = _clean_action_value(value, "speed_use")
+    context.state = "speed_boat_capacity"
+    return MarineReply(text="Approximately how many passengers do you expect per ride?\n\n💡 Example: 4 passengers", context=context)
+
+
+def _speed_boat_capacity(value: str, normalized: str, context: MarineContext) -> MarineReply:
+    if _is_uncertain(normalized):
+        context.state = "project_location"
+        return MarineReply(
+            text=("That’s fine 😊 Our Marine team can guide you on the suitable seating and configuration.\n\n"
+                  "Where will the Speed Boat be operated? Please share the project city or location. 📍"),
+            context=context,
+        )
+    count = _positive_integer(value)
+    if count is None:
+        return MarineReply(text="Please share an approximate passenger count. For example: 4 passengers", context=context)
+    context.passenger_capacity = count
+    context.state = "project_location"
+    return MarineReply(text="Where will the Speed Boat be operated? Please share the project city or location. 📍", context=context)
 
 
 def _project_location(value: str, normalized: str, context: MarineContext) -> MarineReply:
@@ -223,16 +389,14 @@ def _water_body(value: str, normalized: str, context: MarineContext) -> MarineRe
         return MarineReply(text="Please choose the operating water body.", context=context, actions=_actions("Lake", "River", "Reservoir", "Coastal Location", prefix="water"))
     context.water_body = selected.title()
     context.state = "recommendation"
-    capacity = context.passenger_capacity or 0
-    recommended = min((8, 10, 12), key=lambda option: abs(option - capacity)) if capacity else 8
+    product = context.product or "marine solution"
+    usage = context.application or "your intended use"
     return MarineReply(
-        text=(f"Based on your requirement, a {recommended}-seater Pontoon configuration could be suitable.\n\n"
-              "Published options include:\n• Up to 22 ft configurations\n• Marine-grade aluminium construction\n"
-              "• Mechanical / hydraulic steering options\n• Custom seating, canopy, flooring, music and branding options\n\n"
-              "The final engine and configuration should be selected according to your operating conditions.\n\n"
-              "Would you like me to arrange a quotation?"),
+        text=(f"Thank you. We have noted your {product} requirement for {usage} at a {context.water_body.lower()} location.\n\n"
+              "Final capacity, engine, safety equipment and configuration must be confirmed according to the operating conditions and project requirements.\n\n"
+              "Would you like a quotation or a sales consultation?"),
         context=context,
-        actions=QUOTE_ACTIONS,
+        actions=_product_quote_actions(product),
     )
 
 
@@ -241,8 +405,8 @@ def _recommendation(value: str, normalized: str, context: MarineContext) -> Mari
         context.state = "quote_name"
         return MarineReply(text="Sure. I just need a few details for the ECHT Marine team.\n\nMay I have your name?", context=context)
     if _matches(normalized, "marine_view_details", "view more", "details"):
-        return MarineReply(text="Our team can share the relevant technical specifications and configuration options. Would you like a quotation or a sales consultation?", context=context, actions=QUOTE_ACTIONS)
-    return MarineReply(text="Please select how you would like to continue.", context=context, actions=QUOTE_ACTIONS)
+        return MarineReply(text=f"Our team can share the relevant approved {context.product or 'marine'} specifications and configuration options. Would you like a quotation or a sales consultation?", context=context, actions=_product_quote_actions(context.product))
+    return MarineReply(text="Please select how you would like to continue.", context=context, actions=_product_quote_actions(context.product))
 
 
 def _quote_name(value: str, normalized: str, context: MarineContext) -> MarineReply:
@@ -385,6 +549,24 @@ def _is_human_request(normalized: str) -> bool:
     return any(phrase in normalized for phrase in ("talk to echt marine", "talk to sales", "talk to support", "human", "sales person"))
 
 
+def _is_uncertain(normalized: str) -> bool:
+    return normalized in {"not sure", "idk", "i dont know", "i do not know", "not decided", "unsure"}
+
+
+def _is_explicit_action(normalized: str) -> bool:
+    """Buttons are shortcuts into the flow, not text that needs interpretation."""
+    return normalized.startswith(("marine ", "product ", "use ", "speed use ", "water ", "jetty ", "work ", "support ", "goal ", "org ", "tender ", "timeline "))
+
+
+def _is_form_collection_state(state: str) -> bool:
+    """Do not let entity extraction reinterpret values in a committed lead form."""
+    return state in {
+        "quote_name", "quote_company", "quote_quantity", "quote_timeline",
+        "jetty_use", "jetty_location", "jetty_water_body", "jetty_size", "jetty_vessels",
+        "work_solution", "organisation_type", "tender_available", "support_type", "support_reference",
+    }
+
+
 def _clean_action_value(value: str, prefix: str) -> str:
     cleaned = re.sub(rf"^{re.escape(prefix)}[_\s-]*", "", value, flags=re.IGNORECASE)
     return cleaned.replace("_", " ").strip().title()
@@ -392,3 +574,12 @@ def _clean_action_value(value: str, prefix: str) -> str:
 
 def _actions(*titles: str, prefix: str) -> list[MarineAction]:
     return [MarineAction(id=f"{prefix}_{_normalize(title).replace(' ', '_')}", title=title) for title in titles]
+
+
+def _product_quote_actions(product: str | None) -> list[MarineAction]:
+    label = f"View {product} Details" if product else "View More Details"
+    return [
+        MarineAction(id="marine_get_quotation", title="Get Quotation"),
+        MarineAction(id="marine_view_details", title=label),
+        MarineAction(id="marine_talk", title="Talk to Sales"),
+    ]
