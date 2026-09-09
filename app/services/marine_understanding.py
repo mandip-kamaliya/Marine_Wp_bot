@@ -177,7 +177,7 @@ def _find_location(value: str) -> str | None:
     match = re.search(r"\b(?:in|at|near)\s+([A-Z][A-Za-z .'-]{1,48})(?=$|[,.!?])", value)
     if not match:
         return None
-    candidate = match.group(1).strip()
+    candidate = match.group(1).strip(" .")
     return candidate if candidate.casefold() not in {"a", "the", "my resort"} else None
 
 

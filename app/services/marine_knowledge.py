@@ -60,12 +60,13 @@ def looks_like_knowledge_question(text: object) -> bool:
 class MarineKnowledgeService:
     def __init__(
         self,
-        path: Path,
+        path: Path | tuple[Path, ...],
         responder: Callable[[str, tuple[KnowledgeSection, ...]], str] | None = None,
         *,
         max_sections: int = 4,
     ) -> None:
-        self._sections = _load_sections(path)
+        paths = (path,) if isinstance(path, Path) else path
+        self._sections = tuple(section for item in paths for section in _load_sections(item))
         self._responder = responder
         self._max_sections = max(1, max_sections)
 
@@ -98,9 +99,11 @@ class MarineKnowledgeService:
 
 
 def build_marine_knowledge_service(settings: Settings) -> MarineKnowledgeService:
-    path = Path(settings.marine_knowledge_base_path)
-    if not path.is_absolute():
-        path = Path(__file__).resolve().parents[2] / path
+    root = Path(__file__).resolve().parents[2]
+    paths = [Path(settings.marine_knowledge_base_path)]
+    if settings.marine_product_catalog_path:
+        paths.append(Path(settings.marine_product_catalog_path))
+    resolved_paths = tuple(path if path.is_absolute() else root / path for path in paths)
     key, model = settings.openai_api_key, settings.openai_chat_model
     responder = None
     if key is not None and isinstance(model, str) and model.strip():
@@ -136,7 +139,7 @@ def build_marine_knowledge_service(settings: Settings) -> MarineKnowledgeService
         except Exception as error:
             logger.warning("marine_knowledge_openai_unavailable reason=%s", type(error).__name__)
     return MarineKnowledgeService(
-        path, responder, max_sections=settings.marine_knowledge_max_sections,
+        resolved_paths, responder, max_sections=settings.marine_knowledge_max_sections,
     )
 
 

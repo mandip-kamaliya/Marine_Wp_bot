@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from app.services.marine_knowledge import MarineKnowledgeService, looks_like_knowledge_question
+from app.services.marine_products import PRODUCTS, product_actions, products_in_category, render_product_card, render_specifications
 from app.services.marine_understanding import MarineUnderstanding, MarineUnderstandingService
 
 
@@ -23,6 +24,9 @@ class MarineContext(BaseModel):
     customer_phone: str | None = None
     customer_name: str | None = None
     primary_intent: str | None = None
+    category: str | None = None
+    product_id: str | None = None
+    intent: str | None = None
     product: str | None = None
     application: str | None = None
     passenger_capacity: int | None = None
@@ -69,6 +73,15 @@ PRODUCT_ACTIONS = [
     MarineAction(id="product_house_boat", title="House Boat"),
     MarineAction(id="product_kayak_paddle", title="Kayak / Paddle Boat"),
     MarineAction(id="product_unsure", title="Not sure — help me choose"),
+]
+
+USE_CASE_ACTIONS = [
+    MarineAction(id="quote_use_private", title="Private Use"),
+    MarineAction(id="quote_use_resort", title="Resort / Hotel"),
+    MarineAction(id="quote_use_tourism", title="Tourism Project"),
+    MarineAction(id="quote_use_government", title="Government / Project"),
+    MarineAction(id="quote_use_commercial", title="Commercial Operation"),
+    MarineAction(id="quote_use_other", title="Other"),
 ]
 
 PONTOON_USE_ACTIONS = [
@@ -123,6 +136,8 @@ def process_marine_message(
         commercial = _commercial_reply(context, facts)
         if commercial is not None:
             return commercial
+        if facts.product and context.state in {"new", "primary_intent", "product"}:
+            return _show_detected_product(context)
         if knowledge is not None and (facts.asks_question or looks_like_knowledge_question(value)):
             answer = knowledge.answer(value)
             if answer is not None:
@@ -154,6 +169,9 @@ def process_marine_message(
     handlers = {
         "primary_intent": _primary_intent,
         "product": _product,
+        "product_card": _product_card_action,
+        "quote_use_case": _quote_use_case,
+        "expert_name": _expert_name,
         "pontoon_use": _pontoon_use,
         "pontoon_capacity": _pontoon_capacity,
         "speed_boat_use": _speed_boat_use,
@@ -199,6 +217,86 @@ def _merge_understanding(context: MarineContext, facts: MarineUnderstanding) -> 
     elif facts.asks_question:
         updated.last_intent = "knowledge_question"
     return updated
+
+
+def _actions_from_pairs(pairs: tuple[tuple[str, str], ...]) -> list[MarineAction]:
+    return [MarineAction(id=item_id, title=title) for item_id, title in pairs]
+
+
+def _show_card(context: MarineContext, product_id: str) -> MarineReply:
+    product = PRODUCTS[product_id]
+    context.product_id, context.product = product.product_id, product.name
+    context.category, context.state = product.category, "product_card"
+    return MarineReply(text=render_product_card(product), context=context, actions=_actions_from_pairs(product_actions()))
+
+
+def _show_product_options(context: MarineContext, category: str, text: str) -> MarineReply:
+    context.category, context.state = category, "product"
+    options = [MarineAction(id=f"product_{item.product_id}", title=item.name) for item in products_in_category(category)]
+    options.append(MarineAction(id="help_me_choose", title="Help Me Choose"))
+    return MarineReply(text=text, context=context, actions=options)
+
+
+def _show_detected_product(context: MarineContext) -> MarineReply:
+    mapping = {"Speed Boat": "speed_boat", "Aqua Cycle": "aqua_cycle_twin", "Floating Jetty": "modular_floating_dock", "House Boat": "modern_house_boat", "Pontoon Boat": None}
+    product_id = mapping.get(context.product)
+    if product_id:
+        return _show_card(context, product_id)
+    if context.product == "Pontoon Boat":
+        return _show_product_options(context, "boats", "We have a few pontoon options available. Which would you like to explore?")
+    return MarineReply(text="Please select an available product card or talk to an expert for current details.", context=context, actions=PRODUCT_ACTIONS)
+
+
+def _product_card_action(value: str, normalized: str, context: MarineContext) -> MarineReply:
+    product = PRODUCTS.get(context.product_id or "")
+    if product is None:
+        return start_marine_flow(customer_phone=context.customer_phone)
+    if _matches(normalized, "quote_product", "get quotation"):
+        context.intent = "quotation"
+        if context.application:
+            return _begin_qualification(context)
+        context.state = "quote_use_case"
+        return MarineReply(text="To prepare the right quotation, how will you use this product?", context=context, actions=USE_CASE_ACTIONS)
+    if _matches(normalized, "view_specs", "view specifications"):
+        actions = product_actions()[:1] + product_actions()[2:] + (("back_to_product", "Back to Product"),)
+        return MarineReply(text=render_specifications(product), context=context, actions=_actions_from_pairs(actions))
+    if _matches(normalized, "view_photos", "see more photos"):
+        return MarineReply(text="📸 Product photos will be added shortly.\n\nOur team can also share additional product photos directly with you. What would you like to do next?", context=context, actions=_actions_from_pairs(product_actions()[:3]))
+    if _matches(normalized, "talk_expert", "talk to expert"):
+        context.intent = "expert_consultation"
+        if context.customer_name:
+            return _handover(context, "customer_requested_expert", "I'll connect you with an ECHT Marine expert with the details you have already shared.")
+        context.state = "expert_name"
+        return MarineReply(text="Sure. May I have your name so our ECHT Marine expert can assist you?", context=context)
+    return _show_card(context, product.product_id)
+
+
+def _quote_use_case(value: str, normalized: str, context: MarineContext) -> MarineReply:
+    labels = {"private": "Private Use", "resort": "Resort / Hotel", "tourism": "Tourism Project", "government": "Government / Institutional Project", "commercial": "Commercial Operation", "other": "Other"}
+    selected = next((label for key, label in labels.items() if key in normalized), None)
+    if selected is None:
+        return MarineReply(text="Please choose how you plan to use this product.", context=context, actions=USE_CASE_ACTIONS)
+    context.application = selected
+    return _begin_qualification(context)
+
+
+def _begin_qualification(context: MarineContext) -> MarineReply:
+    if context.product_id in {"pontoon_24ft", "pontoon_20ft", "electric_tritoon"}:
+        context.product = "Pontoon Boat"
+    elif context.product_id == "speed_boat":
+        context.product = "Speed Boat"
+    next_reply = _next_requirement_reply(context)
+    if next_reply is not None:
+        return next_reply
+    context.state = "quote_name"
+    return MarineReply(text="May I have your name for the quotation?", context=context)
+
+
+def _expert_name(value: str, normalized: str, context: MarineContext) -> MarineReply:
+    if not value:
+        return MarineReply(text="Please share your name so our expert can assist you.", context=context)
+    context.customer_name = value
+    return _handover(context, "customer_requested_expert", "Thank you. I'll connect you with an ECHT Marine expert.")
 
 
 def _live_confirmation_handover(context: MarineContext, facts: MarineUnderstanding) -> MarineReply | None:
@@ -297,6 +395,12 @@ def _primary_intent(value: str, normalized: str, context: MarineContext) -> Mari
 
 
 def _product(value: str, normalized: str, context: MarineContext) -> MarineReply:
+    product_id = normalized.removeprefix("product ").replace(" ", "_")
+    if product_id in PRODUCTS:
+        return _show_card(context, product_id)
+    if _matches(normalized, "help_me_choose", "product_unsure", "not sure"):
+        context.state = "chooser_goal"
+        return MarineReply(text="I can help you choose. What will you mainly use it for?", context=context, actions=_actions("Premium Guest Experience", "Water-sports Activity", "Passenger Transportation", "Resort Attraction", "Rescue / Emergency Service", "Waterfront Infrastructure", prefix="goal"))
     products = {
         "pontoon": "Pontoon Boat", "aqua cycle": "Aqua Cycle", "bumper": "Bumper Boat",
         "speed": "Speed Boat", "jet ski": "Jet Ski", "house": "House Boat",
@@ -309,18 +413,7 @@ def _product(value: str, normalized: str, context: MarineContext) -> MarineReply
     if product is None:
         return MarineReply(text="Please select a product, or choose ‘Not sure — help me choose’.", context=context, actions=PRODUCT_ACTIONS)
     context.product = product
-    if product == "Pontoon Boat":
-        context.state = "pontoon_use"
-        return MarineReply(text="What are you planning to use the Pontoon Boat for?", context=context, actions=PONTOON_USE_ACTIONS)
-    if product == "Speed Boat":
-        context.state = "speed_boat_use"
-        return MarineReply(
-            text="Great. What will the Speed Boat be used for?",
-            context=context,
-            actions=_actions("Resort / Tourism Rides", "Private Use", "Water Sports", "Commercial Operation", prefix="speed_use"),
-        )
-    context.state = "project_location"
-    return MarineReply(text=f"Great choice. Where will the {product} be operated? Please share the project city or location. 📍", context=context)
+    return _show_detected_product(context)
 
 
 def _pontoon_use(value: str, normalized: str, context: MarineContext) -> MarineReply:
@@ -388,6 +481,11 @@ def _water_body(value: str, normalized: str, context: MarineContext) -> MarineRe
     if selected is None:
         return MarineReply(text="Please choose the operating water body.", context=context, actions=_actions("Lake", "River", "Reservoir", "Coastal Location", prefix="water"))
     context.water_body = selected.title()
+    if context.intent == "quotation":
+        context.state = "quote_name"
+        if context.customer_name:
+            return _quote_company("", "", context)
+        return MarineReply(text="May I have your name for the quotation?", context=context)
     context.state = "recommendation"
     product = context.product or "marine solution"
     usage = context.application or "your intended use"
@@ -555,7 +653,7 @@ def _is_uncertain(normalized: str) -> bool:
 
 def _is_explicit_action(normalized: str) -> bool:
     """Buttons are shortcuts into the flow, not text that needs interpretation."""
-    return normalized.startswith(("marine ", "product ", "use ", "speed use ", "water ", "jetty ", "work ", "support ", "goal ", "org ", "tender ", "timeline "))
+    return normalized.startswith(("marine ", "product ", "use ", "speed use ", "water ", "jetty ", "work ", "support ", "goal ", "org ", "tender ", "timeline ", "quote ", "view ", "talk ", "back ", "help "))
 
 
 def _is_form_collection_state(state: str) -> bool:

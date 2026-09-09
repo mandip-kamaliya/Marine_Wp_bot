@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     openai_embedding_model: str | None = None
     openai_embedding_dimensions: int | None = None
     marine_knowledge_base_path: str = "documents/active/ECHT_MARINE_KNOWLEDGE_BASE_V2.md"
+    marine_product_catalog_path: str | None = "documents/active/ECHT_MARINE_PRODUCT_CATALOG.md"
     marine_knowledge_max_sections: int = Field(default=4, ge=1, le=8)
 
     chatbot_enabled: bool = False

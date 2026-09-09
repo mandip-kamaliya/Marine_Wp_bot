@@ -22,7 +22,10 @@ def build_zoho_lead(context: MarineContext) -> dict[str, Any]:
     last_name = parts[-1]
     details = [
         "Source: ECHT Marine WhatsApp Chatbot",
+        f"Category: {context.category or 'Not captured'}",
+        f"Product ID: {context.product_id or 'Not captured'}",
         f"Intent: {context.primary_intent or 'Not captured'}",
+        f"Customer intent: {context.intent or 'Not captured'}",
         f"Product: {context.product or context.work_solution or 'Not captured'}",
         f"Application: {context.application or context.jetty_use or 'Not captured'}",
         f"Passenger capacity: {context.passenger_capacity or 'Not captured'}",

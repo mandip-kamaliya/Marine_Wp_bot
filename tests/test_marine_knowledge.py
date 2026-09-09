@@ -6,6 +6,7 @@ from app.services.marine_understanding import MarineUnderstandingService
 
 
 KB = Path(__file__).resolve().parents[1] / "documents/active/ECHT_MARINE_KNOWLEDGE_BASE_V2.md"
+PRODUCT_CATALOG = Path(__file__).resolve().parents[1] / "documents/active/ECHT_MARINE_PRODUCT_CATALOG.md"
 
 
 def responder(question, sections):
@@ -88,3 +89,16 @@ def test_live_stock_request_is_handed_to_a_person_not_invented():
 
     assert result.handover is True
     assert result.handover_reason == "live_inventory_requested"
+
+
+def test_product_catalog_adds_party_boat_knowledge_without_replacing_v2():
+    seen = []
+    service = MarineKnowledgeService(
+        (KB, PRODUCT_CATALOG),
+        lambda _question, sections: seen.extend(section.heading for section in sections) or "The Party Boat carries up to 80 passengers.",
+    )
+
+    answer = service.answer("How many passengers can the Party Boat carry?")
+
+    assert answer is not None
+    assert "P007" in " ".join(seen)
